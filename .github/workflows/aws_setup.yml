@@ -1,0 +1,100 @@
+name: Create VM (lightsail) and setup VM
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    workflow_dispatch:
+
+jobs:
+  SETUP:
+    runs-on: ubuntu-latest
+    if: contains(github.event.head_commit.message, 'SETUP') || github.event_name == 'workflow_dispatch'
+    
+    steps:
+      - name: Set Deployment Status to In Progress
+        run: |
+          curl -X PATCH "http://localhost:3001/deployment/${{ github.event.repository.name }}" \
+            -H "Content-Type: application/json" \
+            -d '{"status": "setup"}'
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS CLI
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+
+      - name: Create Lightsail Instance
+        run: |
+          INSTANCE_NAME="${{ github.event.repository.name }}"
+          aws lightsail create-instances \
+          --instance-names $INSTANCE_NAME \
+          --availability-zone ap-south-1a \
+          --blueprint-id ubuntu_20_04 \
+          --bundle-id micro_3_1
+
+      - name: Wait for Instance to be Running
+        run: |
+          INSTANCE_NAME="${{ github.event.repository.name }}"
+          while true; do
+            STATUS=$(aws lightsail get-instance --instance-name $INSTANCE_NAME --query 'instance.state.name' --output text)
+            if [ "$STATUS" == "running" ]; then
+              echo "Instance is running."
+              break
+            else
+              echo "Current status: $STATUS. Waiting..."
+              sleep 10
+            fi
+          done
+          aws lightsail open-instance-public-ports --instance-name $INSTANCE_NAME --port-info fromPort=0,toPort=65535,protocol=ALL
+      
+      - name: Get Instance Public IP
+        id: get_ip
+        run: |
+          INSTANCE_NAME="${{ github.event.repository.name }}"
+          INSTANCE_IP=$(aws lightsail get-instance --instance-name $INSTANCE_NAME --query 'instance.publicIpAddress' --output text)
+          echo "INSTANCE_IP=${INSTANCE_IP}" >> $GITHUB_ENV
+      
+      - name: SSH into Lightsail Instance and Run Script
+        run: |
+          # Wait for a few seconds to ensure the instance is accessible
+          sleep 90
+          
+          INSTANCE_NAME="${{ github.event.repository.name }}"
+          # Copy the SSH key
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEFAULT_SSH_PRIVATE_KEY }}" > ~/.ssh/github
+          chmod 400 ~/.ssh/github
+
+          echo "Current Directory: $(pwd)"; echo "Directory Contents: $(ls)"; 
+
+          echo "$INSTANCE_IP"
+
+          # Connect and setup VM
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/github ubuntu@${{ env.INSTANCE_IP }} 'bash -s' < ./startup.sh "$INSTANCE_NAME" "${{ secrets.TOKEN_GITHUB }}"
+      
+      - name: Setup DNS on Cloudflare
+        run: |
+          RESPONSE=$(curl --request POST \
+          --url https://api.cloudflare.com/client/v4/zones/${{ secrets.CLOUDFLARE_ZONE_ID }}/dns_records \
+          --header "Content-Type: application/json" \
+          --header "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+          --data '{
+            "comment": "Domain verification record",
+            "name": "'"${{ github.event.repository.name }}"'",
+            "proxied": false,
+            "ttl": 86400,
+            "content": "'"${{ env.INSTANCE_IP }}"'",
+            "type": "A"
+          }')
+
+          DNS_NAME=$(echo "$RESPONSE" | jq ".result.name")
+          URL="https://$DNS_NAME"
+          echo "DNS Name:- $DNS_NAME"
+          curl -X PATCH "http://localhost:3001/deployment/${{ github.event.repository.name }}" \
+            -H "Content-Type: application/json" \
+            -d '{"status": "not_started","url":"https://${{github.event.repository.name}}.opengig.work/"}'
